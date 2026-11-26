@@ -170,6 +170,9 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    if !crate::inplace::section_views_shared(device) {
+        return Err((5, "the card does not see a section's bytes through a heap opened on a view (vkd3d-proton)".to_owned()));
+    }
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };

@@ -805,6 +805,47 @@ impl Rig {
     }
 }
 
+/// Whether the card sees a section's bytes through a heap opened on a view
+/// of it (`OpenExistingHeapFromAddress1`), as renderer port 1 opens the
+/// title's graphics memory. Tried once, on a section of our own. Under
+/// vkd3d-proton on RADV it does not: the card reads zeros and the picture
+/// is black.
+pub(crate) fn section_views_shared(device: &ID3D12Device) -> bool {
+    static SHARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHARED.get_or_init(|| {
+        const SIZE: usize = 2 * K64;
+        // SAFETY: the section and view made here, `SIZE` bytes, released below.
+        unsafe {
+            let handle = mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_COMMIT,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            if handle.is_null() {
+                return false;
+            }
+            let view = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, SIZE);
+            let at = view.Value.cast::<u8>();
+            let shared = !at.is_null() && {
+                fill(at, SIZE, 7);
+                let read = open(device, From::Part(at as usize, SIZE)).and_then(|heap| {
+                    let buffer = place(device, &heap, 0, SIZE as u64)?;
+                    Rig::new(device)?.fetch(&buffer, 0, SIZE)
+                });
+                read.is_ok_and(|got| same(at, &got))
+            };
+            if !at.is_null() {
+                mem::UnmapViewOfFile(view);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            shared
+        }
+    })
+}
+
 fn fill(at: *mut u8, len: usize, seed: u8) {
     for i in 0..len {
         // SAFETY: the caller's own committed memory of `len` bytes.
@@ -1458,6 +1499,18 @@ pub(crate) mod tests {
         assert!(probe.section_reads && probe.section_writes, "a committed section in place");
         assert!(probe.section_outlives_views, "the section's heap does not depend on views");
         assert!(probe.reserved_section_refused, "a reserved section is refused");
+    }
+
+    /// The check renderer port 1 makes before it opens a region: the
+    /// software adapter sees a section's bytes through a view's heap.
+    #[test]
+    fn warp_sees_a_section_through_a_heap_on_a_view() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        assert!(section_views_shared(&device));
     }
 
     /// Stage 1's own call on the software adapter: a title buffer that

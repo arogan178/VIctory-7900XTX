@@ -21,7 +21,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -1406,22 +1405,27 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
-    };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    with_source(
+        request,
+        |source| {
+            // The console's order: zlib first, then BCPack.
+            let mut packed;
+            let source = if bc != 0 && options & ZLIB != 0 {
+                packed = vec![0; request.intermediate_size as usize];
+                let n = inflate(source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+                &packed[..n]
+            } else {
+                source
+            };
+            into_destination(request, size, |out| match tables {
+                Some(tables) => bcpack::decode(bc, source, out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+                None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
+            })
+        },
+        |hr| fail(hr, "reading the source"),
+    )?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -1518,18 +1522,42 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// Runs `decode` with a compressed request's source. Most file requests fit
+/// in a reusable worker buffer. Larger reads release their buffer at once.
+fn with_source(
+    request: &Request,
+    decode: impl FnOnce(&[u8]) -> Result<(), HRESULT>,
+    read_error: impl FnOnce(HRESULT) -> HRESULT,
+) -> Result<(), HRESULT> {
+    const RETAINED: usize = 1 << 20;
+    thread_local! {
+        static SOURCE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return decode(bytes);
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    let read = |bytes: &mut [u8]| {
+        read_into(request, bytes).map_err(read_error)?;
+        decode(bytes)
+    };
+    #[cfg(feature = "diagnostics")]
+    let reuse = victory_gpu::switched("VICTORY_DSTORAGE_REUSE_SOURCE").unwrap_or(true);
+    #[cfg(not(feature = "diagnostics"))]
+    let reuse = true;
+    if !reuse || size > RETAINED {
+        return read(&mut vec![0; size]);
+    }
+    SOURCE.with_borrow_mut(|bytes| {
+        if bytes.len() < size {
+            let extra = size - bytes.len();
+            bytes.reserve_exact(extra);
+            bytes.resize(size, 0);
+        }
+        read(&mut bytes[..size])
+    })
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1887,6 +1915,26 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    fn compressed_file_source_reuse_keeps_exact_read_bounds() {
+        let (_dir, file) = file_with(b"abcdefghijklmnop");
+        let read = |offset, size, expect: &[u8]| {
+            let request = request(ZLIB, std::ptr::null_mut(), 0, file, offset, size);
+            with_source(
+                &request,
+                |source| {
+                    assert_eq!(source, expect);
+                    Ok(())
+                },
+                std::convert::identity,
+            )
+        };
+        assert_eq!(read(0, 12, b"abcdefghijkl"), Ok(()));
+        assert_eq!(read(13, 5, b""), Err(END_OF_FILE));
+        assert_eq!(read(7, 3, b"hij"), Ok(()));
+        release::<File>(file.cast());
     }
 
     #[test]
